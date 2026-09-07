@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from typing import Optional
 
 import httpx
@@ -9,35 +10,49 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
 load_dotenv()
+
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TMDB_KEY = os.getenv("TMDB_KEY")
 OMDB_KEY = os.getenv("OMDB_KEY")
 
-# Gemini model.
-# Keep this configurable so you can change models from Vercel
-# without changing the source code.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+# Optional:
+# Set GEMINI_MODEL in Vercel if you want to force a starting model.
+#
+# If not set, the API automatically tries the models below.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
+# Fallback order.
+# If one model is busy/unavailable, the next one is tried.
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+]
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 TMDB_BASE = "https://api.tmdb.org/3"
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-
 
 # ============================================================
-# HTTP SESSION
+# HTTP CLIENT
 # ============================================================
 
 _session = httpx.Client(
     http2=True,
-    timeout=20.0,
+    timeout=httpx.Timeout(
+        connect=10.0,
+        read=30.0,
+        write=10.0,
+        pool=10.0,
+    ),
 )
 
 _session.headers.update(
@@ -53,12 +68,12 @@ _session.headers.update(
 
 
 # ============================================================
-# FASTAPI
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
     title="MovieMoody API",
-    version="2.0.0",
+    version="3.0.0",
     description="Mood-based movie and TV recommendation API powered by Gemini.",
 )
 
@@ -92,26 +107,24 @@ class Movie(BaseModel):
 
 
 # ============================================================
-# VALIDATION / UTILITIES
+# HELPERS
 # ============================================================
 
 def normalize_content_type(content_type: str) -> str:
     """
-    Normalize frontend values.
-
-    Accepted:
-        movie
-        movies
-        film
-        show
-        shows
-        tv
-        tv_show
+    Normalize movie/show input.
     """
 
     value = (content_type or "movie").strip().lower()
 
-    if value in {"show", "shows", "tv", "tv_show", "series"}:
+    if value in {
+        "show",
+        "shows",
+        "tv",
+        "tv_show",
+        "tvshow",
+        "series",
+    }:
         return "show"
 
     return "movie"
@@ -119,8 +132,7 @@ def normalize_content_type(content_type: str) -> str:
 
 def clean_json_text(text: str) -> str:
     """
-    Remove markdown code fences and extract the JSON array
-    if Gemini surrounds it with additional text.
+    Remove markdown code fences and extract JSON array.
     """
 
     if not text:
@@ -128,13 +140,24 @@ def clean_json_text(text: str) -> str:
 
     text = text.strip()
 
-    # Remove markdown fences.
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```$", "", text)
+    # Remove ```json
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove ```
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
 
     text = text.strip()
 
-    # Find the first JSON array.
+    # Find JSON array
     start = text.find("[")
     end = text.rfind("]")
 
@@ -144,103 +167,124 @@ def clean_json_text(text: str) -> str:
     return text
 
 
+def clean_title(title: str) -> str:
+    """
+    Normalize title for searching.
+    """
+
+    if not title:
+        return ""
+
+    title = str(title).strip()
+
+    title = re.sub(
+        r"\s+",
+        " ",
+        title,
+    )
+
+    return title
+
+
+def unique_models() -> list[str]:
+    """
+    Put user-selected model first, followed by fallback models.
+    """
+
+    models = []
+
+    if GEMINI_MODEL:
+        models.append(GEMINI_MODEL)
+
+    for model in GEMINI_MODELS:
+        if model not in models:
+            models.append(model)
+
+    return models
+
+
 # ============================================================
 # GEMINI
 # ============================================================
 
 def get_movies_from_gemini(
     mood: str,
-    content_type: str = "movie",
+    content_type: str,
 ) -> list[dict]:
     """
-    Ask Gemini for exactly six recommendations.
+    Ask Gemini for six recommendations.
 
-    Gemini replaces the old Claude recommendation layer.
-
-    The returned objects contain only:
-        title
-        year
-        why
-
-    TMDB and OMDb are responsible for the actual metadata.
+    Automatically retries temporary Gemini errors and
+    falls back to other Gemini models.
     """
 
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail=(
-                "GEMINI_API_KEY is not configured. "
-                "Add GEMINI_API_KEY to your Vercel Environment Variables."
-            ),
+            detail="GEMINI_API_KEY is not configured.",
+        )
+
+    mood = (mood or "").strip()
+
+    if not mood:
+        raise HTTPException(
+            status_code=400,
+            detail="Mood cannot be empty.",
         )
 
     content_type = normalize_content_type(content_type)
 
     if content_type == "show":
-        kind = "TV shows or series"
-        kind_single = "TV series"
-
-        title_instruction = (
-            'Use the exact TV title as it appears in databases. '
-            'Examples: "Severance", "The Bear", "Dark".'
+        media_name = "TV shows"
+        media_instruction = (
+            "Return television series only. "
+            "Do not return movies."
         )
-
     else:
-        kind = "movies"
-        kind_single = "movie"
-
-        title_instruction = (
-            'Use the exact movie title as it appears in databases. '
-            'Examples: "The Godfather", "Inception", "Dune: Part Two".'
+        media_name = "movies"
+        media_instruction = (
+            "Return movies only. "
+            "Do not return TV shows or series."
         )
 
     prompt = f"""
-You are MovieMoody, an expert {kind_single} recommendation engine.
+You are MovieMoody, an expert entertainment recommendation assistant.
 
-The user's current mood is:
-
+The user currently feels:
 "{mood}"
 
-Recommend exactly 6 {kind} that genuinely match this mood.
+Recommend exactly 6 {media_name} that strongly match this mood.
 
-IMPORTANT:
-- Return exactly 6 items.
-- Do not invent titles.
-- Use real movies/shows that exist.
-- Use exact database-friendly titles.
-- Include a mixture of well-known and interesting choices.
-- Avoid recommending the same title twice.
-- Do not mention streaming platforms.
-- Do not recommend something merely because it is popular.
-- Match the emotional tone of the user's mood.
+{media_instruction}
 
-{title_instruction}
+Choose real, released, well-known titles.
 
-Each item MUST contain exactly these fields:
+Avoid:
+- duplicate titles
+- fake titles
+- unreleased titles
+- vague recommendations
+- titles that do not match the mood
 
-{{
-  "title": "Exact title",
-  "year": "YYYY",
-  "why": "Short explanation of why it matches the mood"
-}}
+Return ONLY valid JSON.
 
-The "why" field must:
-- Be one sentence.
-- Be no more than 12 words.
-- Be specific to the user's mood.
+The JSON must be an array with exactly this structure:
 
-Return ONLY a valid JSON array.
+[
+  {{
+    "title": "Movie or Show Title",
+    "year": "2024",
+    "why": "Short explanation of why it matches the user's mood."
+  }}
+]
 
-Do not use Markdown.
-Do not use ```json.
-Do not add explanations before or after the JSON.
+Rules:
+- Exactly 6 recommendations
+- "year" must be the release year
+- "why" must be concise
+- Do not include markdown
+- Do not include commentary outside the JSON
 """
-
-    url = (
-        f"{GEMINI_BASE}/models/"
-        f"{GEMINI_MODEL}:generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
 
     payload = {
         "contents": [
@@ -256,293 +300,512 @@ Do not add explanations before or after the JSON.
         "generationConfig": {
             "temperature": 0.8,
             "topP": 0.9,
-            "maxOutputTokens": 1000,
+            "maxOutputTokens": 1200,
             "responseMimeType": "application/json",
         },
     }
 
-    try:
-        response = _session.post(
-            url,
-            json=payload,
-            timeout=30.0,
+    models = unique_models()
+
+    temporary_statuses = {
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
+    last_error = None
+
+    # ========================================================
+    # TRY EVERY MODEL
+    # ========================================================
+
+    for model in models:
+
+        url = (
+            f"{GEMINI_BASE}/models/"
+            f"{model}:generateContent"
         )
 
-    except httpx.TimeoutException:
+        # ----------------------------------------------------
+        # RETRY CURRENT MODEL
+        # ----------------------------------------------------
+
+        for attempt in range(3):
+
+            try:
+
+                response = _session.post(
+                    url,
+                    params={
+                        "key": GEMINI_API_KEY,
+                    },
+                    json=payload,
+                )
+
+                # ------------------------------------------------
+                # SUCCESS
+                # ------------------------------------------------
+
+                if response.status_code == 200:
+
+                    data = response.json()
+
+                    candidates = data.get(
+                        "candidates",
+                        [],
+                    )
+
+                    if not candidates:
+                        last_error = (
+                            f"{model}: Gemini returned no candidates."
+                        )
+                        break
+
+                    parts = (
+                        candidates[0]
+                        .get("content", {})
+                        .get("parts", [])
+                    )
+
+                    text_parts = []
+
+                    for part in parts:
+                        text = part.get("text")
+
+                        if text:
+                            text_parts.append(text)
+
+                    text = "".join(text_parts).strip()
+
+                    if not text:
+                        last_error = (
+                            f"{model}: Gemini returned empty text."
+                        )
+                        break
+
+                    cleaned = clean_json_text(text)
+
+                    try:
+                        recommendations = json.loads(cleaned)
+
+                    except json.JSONDecodeError as exc:
+                        last_error = (
+                            f"{model}: Invalid JSON returned by Gemini: "
+                            f"{exc}"
+                        )
+
+                        # Try the model again.
+                        if attempt < 2:
+                            time.sleep(1.5 * (attempt + 1))
+                            continue
+
+                        break
+
+                    if not isinstance(
+                        recommendations,
+                        list,
+                    ):
+                        last_error = (
+                            f"{model}: Gemini response was not a list."
+                        )
+                        break
+
+                    # ------------------------------------------------
+                    # CLEAN RECOMMENDATIONS
+                    # ------------------------------------------------
+
+                    cleaned_recommendations = []
+                    seen_titles = set()
+
+                    for item in recommendations:
+
+                        if not isinstance(item, dict):
+                            continue
+
+                        title = clean_title(
+                            item.get("title", "")
+                        )
+
+                        if not title:
+                            continue
+
+                        normalized_title = title.lower()
+
+                        if normalized_title in seen_titles:
+                            continue
+
+                        seen_titles.add(normalized_title)
+
+                        year = item.get("year")
+
+                        if year is not None:
+                            year = str(year).strip()
+
+                        why = item.get("why")
+
+                        if why is not None:
+                            why = str(why).strip()
+
+                        cleaned_recommendations.append(
+                            {
+                                "title": title,
+                                "year": year,
+                                "why": why,
+                            }
+                        )
+
+                        if len(cleaned_recommendations) >= 6:
+                            break
+
+                    if not cleaned_recommendations:
+                        last_error = (
+                            f"{model}: Gemini returned no usable titles."
+                        )
+                        break
+
+                    print(
+                        f"Gemini recommendation success using {model}"
+                    )
+
+                    return cleaned_recommendations
+
+                # ------------------------------------------------
+                # TEMPORARY GEMINI ERROR
+                # ------------------------------------------------
+
+                if response.status_code in temporary_statuses:
+
+                    try:
+                        error_data = response.json()
+
+                    except Exception:
+                        error_data = response.text
+
+                    last_error = (
+                        f"{model}: HTTP "
+                        f"{response.status_code}: "
+                        f"{error_data}"
+                    )
+
+                    print(
+                        f"Gemini temporary error "
+                        f"{model} "
+                        f"attempt {attempt + 1}/3: "
+                        f"{response.status_code}"
+                    )
+
+                    # Retry with exponential delay.
+                    if attempt < 2:
+
+                        delay = 1.5 * (
+                            2 ** attempt
+                        )
+
+                        time.sleep(delay)
+
+                        continue
+
+                    # All retries failed.
+                    break
+
+                # ------------------------------------------------
+                # INVALID API KEY
+                # ------------------------------------------------
+
+                if response.status_code in {
+                    400,
+                    401,
+                    403,
+                }:
+
+                    try:
+                        error_data = response.json()
+
+                    except Exception:
+                        error_data = response.text
+
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Gemini API authentication or "
+                            "request error: "
+                            f"{error_data}"
+                        ),
+                    )
+
+                # ------------------------------------------------
+                # OTHER ERROR
+                # ------------------------------------------------
+
+                try:
+                    error_data = response.json()
+
+                except Exception:
+                    error_data = response.text
+
+                last_error = (
+                    f"{model}: HTTP "
+                    f"{response.status_code}: "
+                    f"{error_data}"
+                )
+
+                break
+
+            except httpx.TimeoutException as exc:
+
+                last_error = (
+                    f"{model}: timeout: {exc}"
+                )
+
+                print(
+                    f"Gemini timeout "
+                    f"{model} "
+                    f"attempt {attempt + 1}/3"
+                )
+
+                if attempt < 2:
+
+                    time.sleep(
+                        1.5 * (attempt + 1)
+                    )
+
+                    continue
+
+                break
+
+            except httpx.RequestError as exc:
+
+                last_error = (
+                    f"{model}: network error: {exc}"
+                )
+
+                print(
+                    f"Gemini network error "
+                    f"{model}: {exc}"
+                )
+
+                if attempt < 2:
+
+                    time.sleep(
+                        1.5 * (attempt + 1)
+                    )
+
+                    continue
+
+                break
+
+            except HTTPException:
+                raise
+
+            except Exception as exc:
+
+                last_error = (
+                    f"{model}: unexpected error: {exc}"
+                )
+
+                print(
+                    f"Unexpected Gemini error "
+                    f"{model}: {exc}"
+                )
+
+                break
+
+    # ========================================================
+    # ALL MODELS FAILED
+    # ========================================================
+
+    print(
+        "All Gemini models failed.",
+        last_error,
+    )
+
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Gemini is temporarily unavailable. "
+            "All configured Gemini models are currently "
+            "busy or unavailable. Please try again shortly."
+        ),
+    )
+
+
+# ============================================================
+# TMDB REQUEST
+# ============================================================
+
+def tmdb_get(
+    endpoint: str,
+    params: Optional[dict] = None,
+) -> dict:
+
+    if not TMDB_KEY:
         raise HTTPException(
-            status_code=504,
-            detail="Gemini request timed out. Please try again.",
+            status_code=500,
+            detail="TMDB_KEY is not configured.",
         )
+
+    request_params = dict(params or {})
+
+    request_params["api_key"] = TMDB_KEY
+
+    try:
+
+        response = _session.get(
+            f"{TMDB_BASE}{endpoint}",
+            params=request_params,
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except httpx.HTTPStatusError as exc:
+
+        print(
+            "TMDB HTTP error:",
+            exc,
+        )
+
+        return {}
 
     except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cannot reach Gemini API: {exc}",
+
+        print(
+            "TMDB network error:",
+            exc,
         )
 
-    if not response.is_success:
-        try:
-            error_data = response.json()
-
-            error_message = (
-                error_data.get("error", {}).get("message")
-                or response.text
-            )
-
-        except Exception:
-            error_message = response.text
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini API error: {error_message}",
-        )
-
-    try:
-        data = response.json()
-
-        candidates = data.get("candidates", [])
-
-        if not candidates:
-            raise ValueError("Gemini returned no candidates.")
-
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-        )
-
-        text = "".join(
-            part.get("text", "")
-            for part in parts
-            if isinstance(part, dict)
-        ).strip()
+        return {}
 
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Invalid Gemini response: {exc}",
+
+        print(
+            "TMDB error:",
+            exc,
         )
 
-    if not text:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini returned an empty recommendation response.",
-        )
-
-    cleaned = clean_json_text(text)
-
-    try:
-        recommendations = json.loads(cleaned)
-
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini returned invalid recommendation JSON.",
-        )
-
-    if not isinstance(recommendations, list):
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini returned an invalid recommendation format.",
-        )
-
-    # Sanitize the response.
-    cleaned_recommendations = []
-
-    seen_titles = set()
-
-    for item in recommendations:
-        if not isinstance(item, dict):
-            continue
-
-        title = str(item.get("title", "")).strip()
-
-        if not title:
-            continue
-
-        normalized_title = title.lower()
-
-        if normalized_title in seen_titles:
-            continue
-
-        seen_titles.add(normalized_title)
-
-        year = str(item.get("year", "")).strip()
-
-        why = str(item.get("why", "")).strip()
-
-        cleaned_recommendations.append(
-            {
-                "title": title,
-                "year": year or None,
-                "why": why or None,
-            }
-        )
-
-        if len(cleaned_recommendations) == 6:
-            break
-
-    if not cleaned_recommendations:
-        raise HTTPException(
-            status_code=502,
-            detail="Gemini did not return usable movie recommendations.",
-        )
-
-    return cleaned_recommendations
+        return {}
 
 
 # ============================================================
-# TMDB
+# TMDB SEARCH
 # ============================================================
 
-def fetch_tmdb(
+def search_tmdb(
     title: str,
-    year: Optional[str],
-    content_type: str = "movie",
+    content_type: str,
 ) -> Optional[dict]:
-    """
-    Search TMDB and return normalized movie/TV information.
-    """
 
-    content_type = normalize_content_type(content_type)
+    content_type = normalize_content_type(
+        content_type
+    )
+
+    # ========================================================
+    # TV SHOW
+    # ========================================================
 
     if content_type == "show":
-        search_endpoint = f"{TMDB_BASE}/search/tv"
 
-        params = {
-            "api_key": TMDB_KEY,
-            "query": title,
-            "language": "en-US",
-            "page": 1,
-        }
+        data = tmdb_get(
+            "/search/tv",
+            {
+                "query": title,
+                "include_adult": "false",
+                "language": "en-US",
+                "page": 1,
+            },
+        )
 
-        if year and year.isdigit():
-            params["first_air_date_year"] = int(year)
+    # ========================================================
+    # MOVIE
+    # ========================================================
 
     else:
-        search_endpoint = f"{TMDB_BASE}/search/movie"
 
-        params = {
-            "api_key": TMDB_KEY,
-            "query": title,
-            "language": "en-US",
-            "page": 1,
-        }
-
-        if year and year.isdigit():
-            params["year"] = int(year)
-
-    try:
-        response = _session.get(
-            search_endpoint,
-            params=params,
-            timeout=15.0,
+        data = tmdb_get(
+            "/search/movie",
+            {
+                "query": title,
+                "include_adult": "false",
+                "language": "en-US",
+                "page": 1,
+            },
         )
 
-    except httpx.TimeoutException:
-        return None
-
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cannot reach TMDB: {exc}",
-        )
-
-    if not response.is_success:
-        return None
-
-    try:
-        data = response.json()
-    except Exception:
-        return None
-
-    results = data.get("results", [])
+    results = data.get(
+        "results",
+        [],
+    )
 
     if not results:
         return None
 
-    # Prefer exact title matches.
-    normalized_query = title.strip().lower()
+    # ========================================================
+    # TRY EXACT / CLOSE TITLE MATCH
+    # ========================================================
 
-    exact = None
+    title_lower = title.strip().lower()
 
     for result in results:
+
         result_title = (
-            result.get("title")
-            if content_type == "movie"
-            else result.get("name")
+            result.get("name")
+            if content_type == "show"
+            else result.get("title")
         )
 
-        if result_title and result_title.strip().lower() == normalized_query:
-            exact = result
-            break
+        if not result_title:
+            continue
 
-    item = exact or results[0]
+        if result_title.strip().lower() == title_lower:
+            return result
 
-    poster_path = item.get("poster_path")
-
-    if content_type == "show":
-        exact_title = item.get("name")
-        release_date = item.get("first_air_date") or ""
-
-    else:
-        exact_title = item.get("title")
-        release_date = item.get("release_date") or ""
-
-    return {
-        "title": exact_title,
-        "year": release_date[:4] if release_date else None,
-        "poster": (
-            f"{TMDB_IMG}{poster_path}"
-            if poster_path
-            else None
-        ),
-        "overview": item.get("overview"),
-        "genre_ids": item.get("genre_ids", []),
-    }
+    # Otherwise use best TMDB result.
+    return results[0]
 
 
-def fetch_tmdb_genres(content_type: str = "movie") -> dict:
-    """
-    Return:
-        {genre_id: genre_name}
-    """
+# ============================================================
+# TMDB GENRES
+# ============================================================
 
-    content_type = normalize_content_type(content_type)
+def get_tmdb_genres(
+    content_type: str,
+) -> dict[int, str]:
+
+    content_type = normalize_content_type(
+        content_type
+    )
 
     if content_type == "show":
-        endpoint = f"{TMDB_BASE}/genre/tv/list"
-    else:
-        endpoint = f"{TMDB_BASE}/genre/movie/list"
 
-    try:
-        response = _session.get(
-            endpoint,
-            params={
-                "api_key": TMDB_KEY,
+        data = tmdb_get(
+            "/genre/tv/list",
+            {
                 "language": "en-US",
             },
-            timeout=15.0,
         )
 
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Cannot reach TMDB: {exc}",
+    else:
+
+        data = tmdb_get(
+            "/genre/movie/list",
+            {
+                "language": "en-US",
+            },
         )
 
-    if not response.is_success:
-        return {}
-
-    try:
-        genres = response.json().get("genres", [])
-    except Exception:
-        return {}
+    genres = data.get(
+        "genres",
+        [],
+    )
 
     return {
-        genre["id"]: genre["name"]
-        for genre in genres
-        if "id" in genre and "name" in genre
+        int(item["id"]): item["name"]
+        for item in genres
+        if item.get("id") is not None
+        and item.get("name")
     }
 
 
@@ -550,115 +813,237 @@ def fetch_tmdb_genres(content_type: str = "movie") -> dict:
 # OMDB
 # ============================================================
 
-def fetch_omdb_rating(
+def get_imdb_rating(
     title: str,
-    content_type: str = "movie",
+    content_type: str,
 ) -> Optional[str]:
-    """
-    Fetch IMDb rating from OMDb.
-    """
 
     if not OMDB_KEY:
         return None
 
-    params = {
-        "t": title,
-        "apikey": OMDB_KEY,
-    }
+    content_type = normalize_content_type(
+        content_type
+    )
 
-    if normalize_content_type(content_type) == "show":
-        params["type"] = "series"
+    omdb_type = (
+        "series"
+        if content_type == "show"
+        else "movie"
+    )
 
     try:
+
         response = _session.get(
             "https://www.omdbapi.com/",
-            params=params,
-            timeout=15.0,
+            params={
+                "apikey": OMDB_KEY,
+                "t": title,
+                "type": omdb_type,
+            },
         )
 
-    except (httpx.TimeoutException, httpx.RequestError):
-        return None
+        response.raise_for_status()
 
-    if not response.is_success:
-        return None
-
-    try:
         data = response.json()
-    except Exception:
+
+        if data.get("Response") != "True":
+            return None
+
+        rating = data.get(
+            "imdbRating"
+        )
+
+        if not rating:
+            return None
+
+        if rating == "N/A":
+            return None
+
+        return str(rating)
+
+    except httpx.RequestError as exc:
+
+        print(
+            "OMDb network error:",
+            exc,
+        )
+
         return None
 
-    if data.get("Response") == "False":
+    except Exception as exc:
+
+        print(
+            "OMDb error:",
+            exc,
+        )
+
         return None
-
-    rating = data.get("imdbRating")
-
-    if not rating or rating == "N/A":
-        return None
-
-    return str(rating)
 
 
 # ============================================================
-# BUILD FINAL RECOMMENDATION
+# BUILD MOVIE / SHOW
 # ============================================================
 
 def build_movie(
-    ai_item: dict,
-    genre_map: dict,
+    recommendation: dict,
     content_type: str,
-) -> Optional[dict]:
-    """
-    Combine:
-        Gemini
-        +
-        TMDB
-        +
-        OMDb
-    """
+    genre_map: dict[int, str],
+) -> Movie:
 
-    title = ai_item.get("title", "").strip()
-    year = ai_item.get("year")
-    why = ai_item.get("why")
-
-    if not title:
-        return None
-
-    tmdb = fetch_tmdb(
-        title=title,
-        year=year,
-        content_type=content_type,
+    title = clean_title(
+        recommendation.get("title", "")
     )
 
-    if not tmdb:
-        return None
+    year = recommendation.get(
+        "year"
+    )
 
-    exact_title = tmdb["title"]
+    if year is not None:
+        year = str(year).strip()
 
-    imdb_rating = fetch_omdb_rating(
-        exact_title,
+    why = recommendation.get(
+        "why"
+    )
+
+    if why:
+        why = str(why).strip()
+
+    tmdb_result = search_tmdb(
+        title,
         content_type,
     )
 
-    genres = [
-        genre_map.get(genre_id)
-        for genre_id in tmdb.get("genre_ids", [])
-        if genre_id in genre_map
-    ]
+    # ========================================================
+    # DEFAULT VALUES
+    # ========================================================
 
-    genres = [
-        genre
-        for genre in genres
-        if genre
-    ]
+    poster = None
+    genres = []
+    overview = None
+    actual_year = year
+
+    # ========================================================
+    # TMDB DATA
+    # ========================================================
+
+    if tmdb_result:
+
+        poster_path = tmdb_result.get(
+            "poster_path"
+        )
+
+        if poster_path:
+            poster = (
+                f"{TMDB_IMG}"
+                f"{poster_path}"
+            )
+
+        overview = tmdb_result.get(
+            "overview"
+        )
+
+        # ----------------------------------------------------
+        # Genres
+        # ----------------------------------------------------
+
+        genre_ids = tmdb_result.get(
+            "genre_ids",
+            [],
+        )
+
+        genres = [
+            genre_map[genre_id]
+            for genre_id in genre_ids
+            if genre_id in genre_map
+        ]
+
+        # ----------------------------------------------------
+        # Release year
+        # ----------------------------------------------------
+
+        if content_type == "show":
+
+            first_air_date = tmdb_result.get(
+                "first_air_date"
+            )
+
+            if first_air_date:
+                actual_year = (
+                    first_air_date[:4]
+                )
+
+        else:
+
+            release_date = tmdb_result.get(
+                "release_date"
+            )
+
+            if release_date:
+                actual_year = (
+                    release_date[:4]
+                )
+
+    # ========================================================
+    # IMDB RATING
+    # ========================================================
+
+    imdb_rating = get_imdb_rating(
+        title,
+        content_type,
+    )
+
+    return Movie(
+        title=title,
+        year=actual_year,
+        poster=poster,
+        genres=genres,
+        overview=overview,
+        imdb_rating=imdb_rating,
+        why=why,
+    )
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
 
     return {
-        "title": exact_title,
-        "year": tmdb.get("year"),
-        "poster": tmdb.get("poster"),
-        "genres": genres,
-        "overview": tmdb.get("overview"),
-        "imdb_rating": imdb_rating,
-        "why": why,
+        "name": "MovieMoody API",
+        "version": "3.0.0",
+        "status": "online",
+        "ai": "Google Gemini",
+        "endpoints": {
+            "health": "/api/health",
+            "recommend": "/api/recommend",
+            "movie": "/movie/{title}",
+        },
+    }
+
+
+# ============================================================
+# API STATUS
+# ============================================================
+
+@app.get("/api")
+def api_status():
+
+    return {
+        "name": "MovieMoody API",
+        "status": "online",
+        "ai": "Gemini",
+        "gemini_configured": bool(
+            GEMINI_API_KEY
+        ),
+        "tmdb_configured": bool(
+            TMDB_KEY
+        ),
+        "omdb_configured": bool(
+            OMDB_KEY
+        ),
+        "models": unique_models(),
     }
 
 
@@ -666,25 +1051,21 @@ def build_movie(
 # HEALTH CHECK
 # ============================================================
 
-@app.get("/api")
-def root():
-    return {
-        "status": "ok",
-        "message": "MovieMoody API is running",
-        "ai_provider": "Gemini",
-        "model": GEMINI_MODEL,
-    }
-
-
 @app.get("/api/health")
 def health():
+
     return {
         "status": "healthy",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "tmdb_configured": bool(TMDB_KEY),
-        "omdb_configured": bool(OMDB_KEY),
-        "ai_provider": "Gemini",
-        "model": GEMINI_MODEL,
+        "gemini": bool(
+            GEMINI_API_KEY
+        ),
+        "tmdb": bool(
+            TMDB_KEY
+        ),
+        "omdb": bool(
+            OMDB_KEY
+        ),
+        "gemini_models": unique_models(),
     }
 
 
@@ -696,189 +1077,167 @@ def health():
     "/api/recommend",
     response_model=list[Movie],
 )
-def recommend(body: MoodRequest):
-    """
-    Generate six mood-based movie/show recommendations.
+def recommend(
+    request: MoodRequest,
+):
 
-    Request:
-
-    {
-        "mood": "something cozy for a rainy Sunday",
-        "content_type": "movie"
-    }
-
-    Sources:
-
-    Gemini
-        -> titles + reasons
-
-    TMDB
-        -> posters + genres + overview
-
-    OMDb
-        -> IMDb rating
-    """
-
-    mood = body.mood.strip()
+    mood = (
+        request.mood or ""
+    ).strip()
 
     if not mood:
-        raise HTTPException(
-            status_code=400,
-            detail="mood cannot be empty",
-        )
 
-    if len(mood) > 1000:
         raise HTTPException(
             status_code=400,
-            detail="mood is too long. Please keep it under 1000 characters.",
+            detail="Please provide a mood.",
         )
 
     content_type = normalize_content_type(
-        body.content_type
+        request.content_type
     )
 
-    # Required services.
-    missing = []
+    # ========================================================
+    # GEMINI
+    # ========================================================
 
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
+    recommendations = get_movies_from_gemini(
+        mood,
+        content_type,
+    )
 
-    if not TMDB_KEY:
-        missing.append("TMDB_KEY")
+    # ========================================================
+    # GENRES
+    # ========================================================
 
-    if not OMDB_KEY:
-        missing.append("OMDB_KEY")
+    genre_map = get_tmdb_genres(
+        content_type
+    )
 
-    if missing:
+    # ========================================================
+    # BUILD RESULTS
+    # ========================================================
+
+    results = []
+
+    for recommendation in recommendations:
+
+        try:
+
+            movie = build_movie(
+                recommendation,
+                content_type,
+                genre_map,
+            )
+
+            results.append(movie)
+
+        except Exception as exc:
+
+            print(
+                "Error building recommendation:",
+                exc,
+            )
+
+            continue
+
+    # ========================================================
+    # FALLBACK
+    # ========================================================
+
+    if not results:
+
         raise HTTPException(
-            status_code=500,
+            status_code=502,
             detail=(
-                "Missing API environment variables: "
-                + ", ".join(missing)
+                "Recommendations were generated, "
+                "but movie/TV metadata could not be loaded."
             ),
         )
 
-    # --------------------------------------------------------
-    # STEP 1: Gemini
-    # --------------------------------------------------------
-
-    ai_recommendations = get_movies_from_gemini(
-        mood=mood,
-        content_type=content_type,
-    )
-
-    # --------------------------------------------------------
-    # STEP 2: TMDB genres
-    # --------------------------------------------------------
-
-    genre_map = fetch_tmdb_genres(
-        content_type=content_type,
-    )
-
-    # --------------------------------------------------------
-    # STEP 3: Enrich every Gemini recommendation
-    # --------------------------------------------------------
-
-    movies = []
-
-    for item in ai_recommendations:
-
-        movie = build_movie(
-            ai_item=item,
-            genre_map=genre_map,
-            content_type=content_type,
-        )
-
-        if movie:
-            movies.append(movie)
-
-        # Stop at six valid results.
-        if len(movies) == 6:
-            break
-
-    if not movies:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Gemini returned recommendations, "
-                "but none could be matched on TMDB."
-            ),
-        )
-
-    return movies
+    return results
 
 
 # ============================================================
-# SINGLE MOVIE / SHOW
+# MOVIE / SHOW DETAILS
 # ============================================================
 
 @app.get(
     "/movie/{title}",
-    response_model=Movie,
 )
-def get_movie(title: str):
-    """
-    Fetch a single movie by title.
+def movie_details(
+    title: str,
+):
 
-    Example:
-        /movie/Inception
-
-    This endpoint remains compatible with the existing frontend.
-    """
-
-    title = title.strip()
+    title = clean_title(title)
 
     if not title:
+
         raise HTTPException(
             status_code=400,
-            detail="Movie title cannot be empty.",
+            detail="Title cannot be empty.",
         )
 
-    if not TMDB_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="TMDB_KEY is not configured.",
-        )
-
-    genre_map = fetch_tmdb_genres("movie")
-
-    tmdb = fetch_tmdb(
-        title=title,
-        year=None,
-        content_type="movie",
-    )
-
-    if not tmdb:
-        raise HTTPException(
-            status_code=404,
-            detail=f"'{title}' not found on TMDB.",
-        )
-
-    exact_title = tmdb["title"]
-
-    imdb_rating = fetch_omdb_rating(
-        exact_title,
+    # Search movie first.
+    movie = search_tmdb(
+        title,
         "movie",
     )
 
-    genres = [
-        genre_map.get(genre_id)
-        for genre_id in tmdb.get("genre_ids", [])
-        if genre_id in genre_map
-    ]
+    if movie:
 
-    genres = [
-        genre
-        for genre in genres
-        if genre
-    ]
+        return {
+            "type": "movie",
+            "title": movie.get(
+                "title"
+            ),
+            "overview": movie.get(
+                "overview"
+            ),
+            "poster": (
+                f"{TMDB_IMG}"
+                f"{movie['poster_path']}"
+                if movie.get("poster_path")
+                else None
+            ),
+            "release_date": movie.get(
+                "release_date"
+            ),
+            "rating": movie.get(
+                "vote_average"
+            ),
+        }
 
-    return {
-        "title": exact_title,
-        "year": tmdb.get("year"),
-        "poster": tmdb.get("poster"),
-        "genres": genres,
-        "overview": tmdb.get("overview"),
-        "imdb_rating": imdb_rating,
-        "why": None,
-    }
+    # If no movie was found, search TV.
+    show = search_tmdb(
+        title,
+        "show",
+    )
+
+    if show:
+
+        return {
+            "type": "show",
+            "title": show.get(
+                "name"
+            ),
+            "overview": show.get(
+                "overview"
+            ),
+            "poster": (
+                f"{TMDB_IMG}"
+                f"{show['poster_path']}"
+                if show.get("poster_path")
+                else None
+            ),
+            "first_air_date": show.get(
+                "first_air_date"
+            ),
+            "rating": show.get(
+                "vote_average"
+            ),
+        }
+
+    raise HTTPException(
+        status_code=404,
+        detail="Movie or TV show not found.",
+    )
